@@ -1,26 +1,22 @@
 import os
-import json
+import threading
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
-from ..database import SessionLocal, is_postgres
+from ..database import SessionLocal
 from .. import models
 from ..services.payment import hold_payment
 from ..services.nearby import find_nearby_spots
 from datetime import datetime, timezone, timedelta
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-APP_URL = os.getenv("APP_URL", "https://smart-parking.fly.dev")
 DEFAULT_LAT = float(os.getenv("DEFAULT_LAT", "41.2995"))
 DEFAULT_LON = float(os.getenv("DEFAULT_LON", "69.2401"))
-
-_bot_app: Application = None
 
 
 async def _start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Assalomu alaykum! Smart Parking botiga xush kelibsiz.\n\n"
         "/nearby - Yaqin atrofdagi bo'sh joylarni ko'rish\n"
-        "/book <id> - Joyni bron qilish\n"
         "/balance - Balansni ko'rish\n"
         "/register <telefon> <ism> - Ro'yxatdan o'tish"
     )
@@ -33,10 +29,10 @@ async def _nearby(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not spots:
             await update.message.reply_text("Yaqin atrofda bo'sh joy topilmadi.")
             return
-        msg = "Yaqin atrofdagi bo'sh joylar:\n\n"
+        msg = "Yaqin atrofdagi bo'sh joylar:"
         buttons = []
         for spot in spots:
-            msg += f"📍 {spot.address}\n💰 {spot.hourly_rate} so'm/soat\n🆔 ID: {spot.id}\n\n"
+            msg += f"📍 {spot.address}💰 {spot.hourly_rate} so'm/soat\n\n"
             buttons.append([InlineKeyboardButton(f"Bron {spot.id}", callback_data=f"book_{spot.id}")])
         await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(buttons))
     finally:
@@ -105,34 +101,21 @@ async def _balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.close()
 
 
-def get_bot_app() -> Application:
-    global _bot_app
-    if _bot_app is not None:
-        return _bot_app
+def run_bot():
     if not BOT_TOKEN:
-        return None
-    _bot_app = Application.builder().token(BOT_TOKEN).build()
-    _bot_app.add_handler(CommandHandler("start", _start))
-    _bot_app.add_handler(CommandHandler("nearby", _nearby))
-    _bot_app.add_handler(CommandHandler("register", _register))
-    _bot_app.add_handler(CommandHandler("balance", _balance))
-    _bot_app.add_handler(CallbackQueryHandler(_book_callback, pattern="^book_"))
-    return _bot_app
-
-
-async def setup_webhook():
-    app = get_bot_app()
-    if not app:
+        print("[BOT] Token yo'q. Bot ishga tushmadi.")
         return
-    webhook_url = f"{APP_URL}/telegram-webhook"
-    await app.bot.set_webhook(url=webhook_url)
-    print(f"[BOT] Webhook set: {webhook_url}")
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", _start))
+    app.add_handler(CommandHandler("nearby", _nearby))
+    app.add_handler(CommandHandler("register", _register))
+    app.add_handler(CommandHandler("balance", _balance))
+    app.add_handler(CallbackQueryHandler(_book_callback, pattern="^book_"))
+    print("[BOT] Telegram bot polling...")
+    app.run_polling()
 
 
-async def handle_webhook(data: dict):
-    app = get_bot_app()
-    if not app:
-        return {"ok": False, "error": "Bot not configured"}
-    update = Update.de_json(data, app.bot)
-    await app.process_update(update)
-    return {"ok": True}
+def start_bot_thread():
+    thread = threading.Thread(target=run_bot, daemon=True)
+    thread.start()
+    print("[BOT] Bot thread started")
