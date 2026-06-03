@@ -1,7 +1,7 @@
 import os
+import time
 import threading
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+import requests
 from ..database import SessionLocal
 from .. import models
 from ..services.payment import hold_payment
@@ -9,113 +9,142 @@ from ..services.nearby import find_nearby_spots
 from datetime import datetime, timezone, timedelta
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 DEFAULT_LAT = float(os.getenv("DEFAULT_LAT", "41.2995"))
 DEFAULT_LON = float(os.getenv("DEFAULT_LON", "69.2401"))
 
 
-async def _start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Assalomu alaykum! Smart Parking botiga xush kelibsiz.\n\n"
-        "/nearby - Yaqin atrofdagi bo'sh joylarni ko'rish\n"
-        "/balance - Balansni ko'rish\n"
-        "/register <telefon> <ism> - Ro'yxatdan o'tish"
-    )
-
-
-async def _nearby(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    db = SessionLocal()
+def _send(chat_id: int, text: str, keyboard=None):
+    data = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    if keyboard:
+        data["reply_markup"] = {"inline_keyboard": keyboard}
     try:
-        spots = find_nearby_spots(db, DEFAULT_LAT, DEFAULT_LON, radius_km=3.0)
-        if not spots:
-            await update.message.reply_text("Yaqin atrofda bo'sh joy topilmadi.")
+        requests.post(f"{API_URL}/sendMessage", json=data, timeout=5)
+    except Exception:
+        pass
+
+
+def _handle(text: str, chat_id: int, user_id: int):
+    args = text.strip().split()
+
+    if text == "/start":
+        _send(chat_id, "Assalomu alaykum! Smart Parking botiga xush kelibsiz.\n\n"
+               "/nearby - Yaqin atrofdagi bo'sh joylar\n"
+               "/register <tel> <ism> - Ro'yxatdan o'tish\n"
+               "/balance - Balans")
+
+    elif text == "/nearby":
+        db = SessionLocal()
+        try:
+            spots = find_nearby_spots(db, DEFAULT_LAT, DEFAULT_LON, radius_km=3.0)
+            if not spots:
+                _send(chat_id, "Yaqin atrofda bo'sh joy topilmadi.")
+                return
+            msg = "Yaqin atrofdagi joylar:\n\n"
+            keyboard = []
+            for s in spots:
+                msg += f"📍 {s.address}\n💰 {s.hourly_rate} so'm/soat\n\n"
+                keyboard.append([{"text": f"Bron {s.id}", "callback_data": f"book_{s.id}"}])
+            _send(chat_id, msg, keyboard)
+        finally:
+            db.close()
+
+    elif text.startswith("/register"):
+        if len(args) < 3:
+            _send(chat_id, "/register <telefon> <ism>\nMasalan: /register 998901234567 Alisher")
             return
-        msg = "Yaqin atrofdagi bo'sh joylar:"
-        buttons = []
-        for spot in spots:
-            msg += f"📍 {spot.address}💰 {spot.hourly_rate} so'm/soat\n\n"
-            buttons.append([InlineKeyboardButton(f"Bron {spot.id}", callback_data=f"book_{spot.id}")])
-        await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(buttons))
-    finally:
-        db.close()
+        phone, name = args[1], " ".join(args[2:])
+        db = SessionLocal()
+        try:
+            if db.query(models.User).filter(models.User.phone_number == phone).first():
+                _send(chat_id, "Bu raqam avval ro'yxatdan o'tgan.")
+                return
+            db.add(models.User(phone_number=phone, full_name=name, role="driver", balance=50000.0))
+            db.commit()
+            _send(chat_id, f"✅ {name}, ro'yxatdan o'tdingiz! Boshlang'ich balans: 50,000 so'm")
+        finally:
+            db.close()
+
+    elif text == "/balance":
+        db = SessionLocal()
+        try:
+            user = db.query(models.User).filter(models.User.phone_number == str(user_id)).first()
+            if not user:
+                _send(chat_id, "Avval /register orqali ro'yxatdan o'ting.")
+                return
+            _send(chat_id, f"💰 Balansingiz: {user.balance:,.0f} so'm")
+        finally:
+            db.close()
+
+    elif text.startswith("book_"):
+        spot_id = int(text.split("_")[1])
+        db = SessionLocal()
+        try:
+            user = db.query(models.User).filter(models.User.phone_number == str(user_id)).first()
+            if not user:
+                _send(chat_id, "Avval /register orqali ro'yxatdan o'ting.")
+                return
+            spot = db.query(models.ParkingSpot).filter(models.ParkingSpot.id == spot_id).first()
+            if not spot or spot.is_occupied:
+                _send(chat_id, "Bu joy band yoki mavjud emas.")
+                return
+            total = spot.hourly_rate
+            if not hold_payment(db, user.id, total):
+                _send(chat_id, "Mablag' yetarli emas.")
+                return
+            reservation = models.Reservation(
+                driver_id=user.id, parking_spot_id=spot.id,
+                start_time=datetime.now(timezone.utc),
+                end_time=datetime.now(timezone.utc) + timedelta(hours=1),
+                total_price=total, status="active",
+            )
+            spot.is_occupied = True
+            db.add(reservation)
+            db.commit()
+            _send(chat_id, f"✅ {spot.address} bron qilindi!\n1 soat - {total} so'm")
+        finally:
+            db.close()
 
 
-async def _book_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    spot_id = int(query.data.split("_")[1])
-    db = SessionLocal()
-    try:
-        user = db.query(models.User).filter(models.User.phone_number == str(update.effective_user.id)).first()
-        if not user:
-            await query.edit_message_text("Avval /register orqali ro'yxatdan o'ting.")
-            return
-        spot = db.query(models.ParkingSpot).filter(models.ParkingSpot.id == spot_id).first()
-        if not spot or spot.is_occupied:
-            await query.edit_message_text("Bu joy band yoki mavjud emas.")
-            return
-        hours, total = 1, spot.hourly_rate
-        if not hold_payment(db, user.id, total):
-            await query.edit_message_text("Mablag' yetarli emas.")
-            return
-        reservation = models.Reservation(
-            driver_id=user.id, parking_spot_id=spot.id,
-            start_time=datetime.now(timezone.utc),
-            end_time=datetime.now(timezone.utc) + timedelta(hours=hours),
-            total_price=total, status="active",
-        )
-        spot.is_occupied = True
-        db.add(reservation)
-        db.commit()
-        await query.edit_message_text(f"✅ {spot.address} bron qilindi!\n{hours} soat - {total} so'm")
-    finally:
-        db.close()
+def _poll():
+    last_id = 0
+    while True:
+        try:
+            r = requests.get(f"{API_URL}/getUpdates", params={
+                "offset": last_id + 1, "timeout": 30,
+            }, timeout=35)
+            data = r.json()
+            if not data.get("ok"):
+                continue
+            for update in data["result"]:
+                last_id = update["update_id"]
+                msg = update.get("message") or update.get("callback_query", {}).get("message")
+                if not msg:
+                    continue
+                chat_id = msg["chat"]["id"]
+                user_id = msg["from"]["id"]
+                text = ""
 
+                if "text" in msg:
+                    text = msg["text"]
+                elif "callback_query" in update:
+                    text = update["callback_query"]["data"]
+                    cb_id = update["callback_query"]["id"]
+                    requests.post(f"{API_URL}/answerCallbackQuery", json={
+                        "callback_query_id": cb_id,
+                    }, timeout=3)
 
-async def _register(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if len(args) < 2:
-        await update.message.reply_text("/register <telefon> <ism>")
-        return
-    phone, name = args[0], " ".join(args[1:])
-    db = SessionLocal()
-    try:
-        if db.query(models.User).filter(models.User.phone_number == phone).first():
-            await update.message.reply_text("Bu raqam avval ro'yxatdan o'tgan.")
-            return
-        db.add(models.User(phone_number=phone, full_name=name, role="driver", balance=50000.0))
-        db.commit()
-        await update.message.reply_text(f"✅ {name}, ro'yxatdan o'tdingiz! Boshlang'ich balans: 50,000 so'm")
-    finally:
-        db.close()
-
-
-async def _balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    db = SessionLocal()
-    try:
-        user = db.query(models.User).filter(models.User.phone_number == str(update.effective_user.id)).first()
-        if not user:
-            await update.message.reply_text("Avval /register orqali ro'yxatdan o'ting.")
-            return
-        await update.message.reply_text(f"💰 Balansingiz: {user.balance:,.0f} so'm")
-    finally:
-        db.close()
-
-
-def run_bot():
-    if not BOT_TOKEN:
-        print("[BOT] Token yo'q. Bot ishga tushmadi.")
-        return
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", _start))
-    app.add_handler(CommandHandler("nearby", _nearby))
-    app.add_handler(CommandHandler("register", _register))
-    app.add_handler(CommandHandler("balance", _balance))
-    app.add_handler(CallbackQueryHandler(_book_callback, pattern="^book_"))
-    print("[BOT] Telegram bot polling...")
-    app.run_polling()
+                if text:
+                    _handle(text, chat_id, user_id)
+        except Exception as e:
+            print(f"[BOT] Poll error: {e}")
+            time.sleep(3)
 
 
 def start_bot_thread():
-    thread = threading.Thread(target=run_bot, daemon=True)
+    if not BOT_TOKEN:
+        print("[BOT] Token yo'q. Bot ishga tushmadi.")
+        return
+    thread = threading.Thread(target=_poll, daemon=True)
     thread.start()
-    print("[BOT] Bot thread started")
+    print("[BOT] Bot polling thread started")
