@@ -9,31 +9,39 @@ from ..services.nearby import find_nearby_spots
 from datetime import datetime, timezone, timedelta
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 DEFAULT_LAT = float(os.getenv("DEFAULT_LAT", "41.2995"))
 DEFAULT_LON = float(os.getenv("DEFAULT_LON", "69.2401"))
 
 
+def _api(method: str, data: dict = None):
+    if not BOT_TOKEN:
+        return None
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+    try:
+        r = requests.post(url, json=data or {}, timeout=10)
+        return r.json()
+    except Exception:
+        return None
+
+
 def _send(chat_id: int, text: str, keyboard=None):
-    data = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    data = {"chat_id": chat_id, "text": text}
     if keyboard:
         data["reply_markup"] = {"inline_keyboard": keyboard}
-    try:
-        requests.post(f"{API_URL}/sendMessage", json=data, timeout=5)
-    except Exception:
-        pass
+    _api("sendMessage", data)
 
 
 def _handle(text: str, chat_id: int, user_id: int):
     args = text.strip().split()
+    t = text.strip()
 
-    if text == "/start":
+    if t == "/start":
         _send(chat_id, "Assalomu alaykum! Smart Parking botiga xush kelibsiz.\n\n"
                "/nearby - Yaqin atrofdagi bo'sh joylar\n"
                "/register <tel> <ism> - Ro'yxatdan o'tish\n"
                "/balance - Balans")
 
-    elif text == "/nearby":
+    elif t == "/nearby":
         db = SessionLocal()
         try:
             spots = find_nearby_spots(db, DEFAULT_LAT, DEFAULT_LON, radius_km=3.0)
@@ -49,7 +57,7 @@ def _handle(text: str, chat_id: int, user_id: int):
         finally:
             db.close()
 
-    elif text.startswith("/register"):
+    elif t.startswith("/register"):
         if len(args) < 3:
             _send(chat_id, "/register <telefon> <ism>\nMasalan: /register 998901234567 Alisher")
             return
@@ -65,7 +73,7 @@ def _handle(text: str, chat_id: int, user_id: int):
         finally:
             db.close()
 
-    elif text == "/balance":
+    elif t == "/balance":
         db = SessionLocal()
         try:
             user = db.query(models.User).filter(models.User.phone_number == str(user_id)).first()
@@ -76,8 +84,8 @@ def _handle(text: str, chat_id: int, user_id: int):
         finally:
             db.close()
 
-    elif text.startswith("book_"):
-        spot_id = int(text.split("_")[1])
+    elif t.startswith("book_"):
+        spot_id = int(t.split("_")[1])
         db = SessionLocal()
         try:
             user = db.query(models.User).filter(models.User.phone_number == str(user_id)).first()
@@ -92,14 +100,13 @@ def _handle(text: str, chat_id: int, user_id: int):
             if not hold_payment(db, user.id, total):
                 _send(chat_id, "Mablag' yetarli emas.")
                 return
-            reservation = models.Reservation(
+            db.add(models.Reservation(
                 driver_id=user.id, parking_spot_id=spot.id,
                 start_time=datetime.now(timezone.utc),
                 end_time=datetime.now(timezone.utc) + timedelta(hours=1),
                 total_price=total, status="active",
-            )
+            ))
             spot.is_occupied = True
-            db.add(reservation)
             db.commit()
             _send(chat_id, f"✅ {spot.address} bron qilindi!\n1 soat - {total} so'm")
         finally:
@@ -107,44 +114,41 @@ def _handle(text: str, chat_id: int, user_id: int):
 
 
 def _poll():
+    if not BOT_TOKEN:
+        return
     last_id = 0
     while True:
         try:
-            r = requests.get(f"{API_URL}/getUpdates", params={
-                "offset": last_id + 1, "timeout": 30,
-            }, timeout=35)
+            r = requests.get(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
+                params={"offset": last_id + 1, "timeout": 30},
+                timeout=35,
+            )
             data = r.json()
             if not data.get("ok"):
+                time.sleep(3)
                 continue
-            for update in data["result"]:
+            for update in data.get("result", []):
                 last_id = update["update_id"]
-                msg = update.get("message") or update.get("callback_query", {}).get("message")
-                if not msg:
-                    continue
-                chat_id = msg["chat"]["id"]
-                user_id = msg["from"]["id"]
-                text = ""
+                msg = update.get("message")
+                cb = update.get("callback_query")
 
-                if "text" in msg:
-                    text = msg["text"]
-                elif "callback_query" in update:
-                    text = update["callback_query"]["data"]
-                    cb_id = update["callback_query"]["id"]
-                    requests.post(f"{API_URL}/answerCallbackQuery", json={
-                        "callback_query_id": cb_id,
-                    }, timeout=3)
-
-                if text:
+                if cb:
+                    chat_id = cb["message"]["chat"]["id"]
+                    user_id = cb["from"]["id"]
+                    text = cb["data"]
+                    _api("answerCallbackQuery", {"callback_query_id": cb["id"]})
                     _handle(text, chat_id, user_id)
-        except Exception as e:
-            print(f"[BOT] Poll error: {e}")
+                elif msg and msg.get("text"):
+                    _handle(msg["text"], msg["chat"]["id"], msg["from"]["id"])
+        except Exception:
             time.sleep(3)
 
 
 def start_bot_thread():
     if not BOT_TOKEN:
-        print("[BOT] Token yo'q. Bot ishga tushmadi.")
+        print("[BOT] Token yo'q")
         return
-    thread = threading.Thread(target=_poll, daemon=True)
-    thread.start()
-    print("[BOT] Bot polling thread started")
+    t = threading.Thread(target=_poll, daemon=True)
+    t.start()
+    print("[BOT] Ishga tushdi")
